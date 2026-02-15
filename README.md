@@ -80,3 +80,15 @@ This repository supports the academic project titled:
 “DrowsyCam: Driver Safety System with Eye Recognition and Drowsiness Detection”
 
 Submitted in partial fulfillment of the requirements for the Bachelor of Science in Computer Engineering.
+
+# How to Run the Application
+
+1. Clone or download this repository.
+
+2. activate the provided virtual environment:
+
+    source PythonProject/.venv/bin/activate
+
+3. Run the main program:
+
+    python Starting.py
