@@ -1,0 +1,838 @@
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
+import os
+import cv2
+import smbus
+from cvzone.FaceMeshModule import FaceMeshDetector
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.pyplot as plt
+from collections import deque
+import time
+import pygame
+
+
+# --- HARDWARE CHECK ---
+pygame.mixer.init()
+pygame.mixer.music.load("alarm.wav")
+pygame.mixer.music.set_volume(1.0)
+
+
+GPIO_AVAILABLE = False
+try:
+    from gpiozero import OutputDevice
+
+    test_led = OutputDevice(17, active_high=True)
+    test_led.close()
+    GPIO_AVAILABLE = True
+
+except Exception as e:
+    print("GPIO INIT FAILED:", e)
+
+
+# --- MPU6050/9250 VEHICLE DYNAMICS CLASS ---
+class MPU_Sensor:
+    def __init__(self, address=0x68):
+        self.bus = smbus.SMBus(1)
+        self.address = address
+        self.connected = False
+        self.speed_kph = 0.0
+        self.last_time = time.time()
+
+        # New variables for smoothing
+        self.turn_timer = 0
+        self.turn_direction = "TURNING"
+
+        try:
+            # Wake up MPU
+            self.bus.write_byte_data(self.address, 0x6B, 0)
+            self.connected = True
+            print("MPU Connected: Vehicle Dynamics Active")
+        except:
+            print("MPU Not Found: Vehicle Logic Disabled")
+
+    def read_raw_data(self, addr):
+        high = self.bus.read_byte_data(self.address, addr)
+        low = self.bus.read_byte_data(self.address, addr + 1)
+        value = ((high << 8) | low)
+        if (value > 32768): value = value - 65536
+        return value
+
+    def get_vehicle_status(self):
+        """ Returns: status_string, speed_kph """
+        # --- SIMULATION MODE ---
+        if not self.connected:
+            return "DRIVING", 65.0
+
+        # --- REAL SENSOR MODE ---
+        try:
+            # Read Raw Data
+            acc_y = self.read_raw_data(0x3D) / 16384.0
+            gyro_z = self.read_raw_data(0x47) / 131.0
+            now = time.time()
+
+            # --- 1. SMOOTH TURN LOGIC ---
+            # Threshold: 15 degrees/sec
+            if abs(gyro_z) > 15:
+                self.turn_timer = now
+                # Detect Left vs Right (Standard MPU: + is Left, - is Right)
+                # If this is backward for your car, swap the words below.
+                if gyro_z > 0:
+                    self.turn_direction = "TURNING LEFT"
+                else:
+                    self.turn_direction = "TURNING RIGHT"
+
+            # Hysteresis: Hold the status for 1.0s to prevent flickering
+            if now - self.turn_timer < 1.0:
+                return self.turn_direction, self.speed_kph
+
+            # --- 2. SPEED LOGIC ---
+            dt = now - self.last_time
+            self.last_time = now
+
+            # Physics Integration (accel -> speed)
+            # Ignore tiny noise < 0.05g
+            if acc_y > 0.05:
+                self.speed_kph += (acc_y * 9.8 * dt) * 3.6 * 2
+            elif acc_y < -0.05:
+                self.speed_kph -= (abs(acc_y) * 9.8 * dt) * 3.6 * 3
+            else:
+                self.speed_kph *= 0.99  # Friction simulation
+
+            # Clamp Speed
+            if self.speed_kph < 0: self.speed_kph = 0
+            if self.speed_kph > 200: self.speed_kph = 200
+
+            # --- 3. STATUS DECISION ---
+            if self.speed_kph < 3.0:
+                self.speed_kph = 0
+                return "STATIONARY", 0
+
+            if acc_y > 0.15: return "ACCELERATING", self.speed_kph
+
+            return "DRIVING", self.speed_kph
+
+        except:
+            return "ERROR", 0
+
+
+# --- CONFIGURATION ---
+THEME = {
+    "bg": "#f4f7f6",
+    "panel_bg": "#ffffff",
+    "primary": "#4daff7",
+    "primary_dark": "#1c86ee",
+    "text": "#2d3436",
+    "warning": "#fdcb6e",
+    "alert": "#d63031",
+    "success": "#00b894",
+    "dark_mode": "#2d3436",
+    "info": "#a29bfe"
+}
+
+# --- GLOBAL VARIABLES ---
+current_state = None
+selected_driver = None
+driver_threshold = 0.25
+driver_closed_eye = 0.20
+driver_open_eye = 0
+Motors = None
+cap = cv2.VideoCapture(0)
+detector = FaceMeshDetector(maxFaces=1)
+mpu = MPU_Sensor()
+
+alarm_playing = False
+alarm_fade_start = None
+
+
+ratio_history = deque(maxlen=50)
+smooth_ear_buffer = deque(maxlen=6)
+
+
+# --- UTILS ---
+
+def log_alarm_event(reason):
+    if not selected_driver:
+        return
+
+    filename = f"{selected_driver.replace(' ', '_')}.txt"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with open(filename, "r") as f:
+            content = f.read()
+
+        if "--- HISTORY ---" not in content:
+            content += "\n--- HISTORY ---\n"
+
+        content += f"{timestamp} | {reason}\n"
+
+        with open(filename, "w") as f:
+            f.write(content)
+
+    except Exception as e:
+        print("History write failed:", e)
+
+def clear_window():
+    for w in root.winfo_children(): w.destroy()
+
+def on_close():
+    print("Shutting down safely...")
+
+    try:
+        if cap.isOpened():
+            cap.release()
+    except:
+        pass
+
+    try:
+        cv2.destroyAllWindows()
+    except:
+        pass
+
+    try:
+        if GPIO_AVAILABLE and Motors:
+            Motors.off()
+    except:
+        pass
+
+    root.destroy()
+
+
+def start_alarm_sound():
+    global alarm_playing, alarm_fade_start
+    if not alarm_playing:
+        pygame.mixer.music.play(-1)  # loop forever
+        pygame.mixer.music.set_volume(1.0)
+        alarm_playing = True
+        alarm_fade_start = None
+
+def stop_alarm_sound():
+    global alarm_playing, alarm_fade_start
+    if alarm_playing:
+        alarm_fade_start = time.time()
+
+def update_alarm_sound():
+    global alarm_playing, alarm_fade_start
+
+    if alarm_fade_start is not None:
+        elapsed = time.time() - alarm_fade_start
+
+        if elapsed >= 1.0:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.set_volume(1.0)
+            alarm_playing = False
+            alarm_fade_start = None
+        else:
+            volume = 1.0 - elapsed
+            pygame.mixer.music.set_volume(max(0.0, volume))
+
+
+
+def create_keyboard(parent, entry):
+    keys = ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'Z', 'X',
+            'C', 'V', 'B', 'N', 'M', 'BKSP']
+    f = tk.Frame(parent, bg=THEME["bg"])
+    f.pack(pady=10)
+    r, c = 0, 0
+    for k in keys:
+        cmd = (lambda: entry.delete(len(entry.get()) - 1, tk.END)) if k == 'BKSP' else (
+            lambda x=k: entry.insert(tk.END, x))
+        tk.Button(f, text=k if k != 'BKSP' else '⌫', width=4, height=2, bg="white", command=cmd).grid(row=r, column=c,
+                                                                                                      padx=2, pady=2)
+        c += 1
+        if c > 9: c = 0; r += 1
+
+
+def set_state(name, **kwargs):
+    global current_state, selected_driver, driver_threshold, driver_closed_eye, driver_open_eye
+    current_state = name
+    clear_window()
+    if name == "start":
+        build_start_screen()
+    elif name == "driver_selection":
+        build_driver_selection_screen()
+    elif name == "face_registration":
+        build_face_registration_screen()
+    elif name == "history":
+        build_history_screen()
+    elif name == "operation":
+        selected_driver = kwargs.get("driver", "Unknown")
+        driver_threshold = kwargs.get("threshold", 0.25)
+        driver_closed_eye = kwargs.get("closed_eye", 0.20)
+        driver_open_eye = kwargs.get("open_eye", 0.40)
+        build_operation_screen()
+
+
+# --- SCREENS ---
+def build_history_screen():
+    root.configure(bg=THEME["dark_mode"])
+
+    # --- TOP BAR ---
+    top_bar = tk.Frame(root, bg=THEME["dark_mode"])
+    top_bar.pack(fill="x", pady=(10, 0), padx=10)
+
+    tk.Button(
+        top_bar,
+        text="← BACK",
+        font=("Arial", 11, "bold"),
+        bg="#2d3436",
+        fg="white",
+        relief="flat",
+        padx=12,
+        pady=6,
+        command=lambda: set_state(
+            "operation",
+            driver=selected_driver,
+            threshold=driver_threshold,
+            closed_eye=driver_closed_eye,
+            open_eye=driver_open_eye
+        )
+    ).pack(side="left")
+
+    tk.Label(
+        top_bar,
+        text=f"HISTORY — {selected_driver}",
+        font=("Helvetica", 20, "bold"),
+        bg=THEME["dark_mode"],
+        fg="white"
+    ).pack(side="left", padx=20)
+
+
+    container = tk.Frame(root, bg=THEME["dark_mode"])
+    container.pack(expand=True, fill="both", padx=40, pady=20)
+
+    box = tk.Frame(container, bg="#353b48", padx=15, pady=15)
+    box.pack(expand=True, fill="both")
+
+    text = tk.Text(
+        box,
+        font=("Courier", 12),
+        bg="#2f3640",
+        fg="white",
+        insertbackground="white",
+        relief="flat",
+        wrap="word"
+    )
+    text.pack(side="left", fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+    scrollbar.pack(side="right", fill="y")
+    text.configure(yscrollcommand=scrollbar.set)
+
+    filename = f"{selected_driver.replace(' ', '_')}.txt"
+
+    try:
+        with open(filename, "r") as f:
+            content = f.read()
+
+        if "--- HISTORY ---" in content:
+            history = content.split("--- HISTORY ---", 1)[1].strip()
+        else:
+            history = "No alarm history recorded."
+
+    except:
+        history = "Unable to load history."
+
+    text.insert("1.0", history)
+    text.config(state="disabled")
+
+    tk.Button(
+        root,
+        text="BACK",
+        font=("Arial", 12, "bold"),
+        bg=THEME["primary"],
+        fg="white",
+        padx=30,
+        pady=10,
+        relief="flat",
+        command=lambda: set_state(
+            "operation",
+            driver=selected_driver,
+            threshold=driver_threshold,
+            closed_eye=driver_closed_eye,
+            open_eye=driver_open_eye
+        )
+    ).pack(pady=20)
+
+
+def build_start_screen():
+    root.configure(bg=THEME["bg"])
+    f = tk.Frame(root, bg=THEME["panel_bg"], padx=40, pady=40, relief="raised", bd=1)
+    f.place(relx=0.5, rely=0.5, anchor="center")
+    tk.Label(f, text="DROWSYCAM", font=("Arial", 30, "bold"), bg=THEME["panel_bg"], fg=THEME["primary"]).pack(pady=10)
+    tk.Button(f, text="START SYSTEM", bg=THEME["primary"], fg="white", font=("Arial", 12, "bold"), padx=30, pady=10,
+              relief="flat", command=lambda: set_state("driver_selection")).pack()
+
+
+def build_driver_selection_screen():
+    root.configure(bg=THEME["bg"])
+    tk.Label(root, text="Select Driver Profile", font=("Helvetica", 24, "bold"), bg=THEME["bg"]).pack(pady=(40, 10))
+    lf = tk.Frame(root, bg=THEME["bg"])
+    lf.pack(expand=True, fill="both", padx=100, pady=20)
+    canvas = tk.Canvas(lf, bg=THEME["bg"], highlightthickness=0)
+    scroll = ttk.Scrollbar(lf, orient="vertical", command=canvas.yview)
+    content = tk.Frame(canvas, bg=THEME["bg"])
+    content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=content, anchor="nw")
+    canvas.configure(yscrollcommand=scroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scroll.pack(side="right", fill="y")
+
+    files = [f for f in os.listdir(".") if f.endswith(".txt")]
+    if files:
+        for fn in sorted(files):
+            nm, th, cl, opn = "Unknown", 0.25, 0.20, 0.40
+            try:
+                with open(fn, "r") as f:
+                    lines = f.readlines()
+                    nm = lines[0].split(":")[1].strip()
+                    opn = float(lines[1].split(":")[1].strip())  # OpenEye
+                    cl = float(lines[2].split(":")[1].strip())  # ClosedEye
+                    th = float(lines[3].split(":")[1].strip())  # Threshold
+
+            except:
+                continue
+            c = tk.Frame(content, bg="white", pady=15, padx=15)
+            c.pack(pady=5, fill="x")
+            tk.Label(c, text=nm, font=("Helvetica", 14, "bold"), bg="white").pack(side="left")
+            tk.Button(c, text="SELECT", bg=THEME["primary"], fg="white", font=("Arial", 10, "bold"), relief="flat",
+                      command=lambda n=nm, t=th, c=cl, o=opn: set_state("operation",
+                                                                        driver=n,
+                                                                        threshold=t,
+                                                                        closed_eye=c,
+                                                                        open_eye=o)).pack(side="right")
+    tk.Button(root, text="REGISTER NEW DRIVER", bg="white", fg=THEME["primary"], font=("Arial", 11, "bold"), padx=20,
+              pady=10, relief="flat", command=lambda: set_state("face_registration")).pack(side="bottom", pady=30)
+
+
+def build_face_registration_screen():
+    root.configure(bg=THEME["bg"])
+    tk.Label(root, text="Registration Wizard", font=("Helvetica", 18, "bold"), bg=THEME["bg"]).pack(pady=20)
+    lbl_instr = tk.Label(root, text="Step 1/3: Keep eyes naturally OPEN.", font=("Helvetica", 12), bg=THEME["bg"],
+                         fg=THEME["primary"])
+    lbl_instr.pack()
+
+    content = tk.Frame(root, bg=THEME["bg"])
+    content.pack(expand=True, fill="both", padx=20, pady=10)
+    v_box = tk.Frame(content, bg="black", bd=2, relief="sunken")
+    v_box.pack(pady=10)
+    v_lbl = tk.Label(v_box, bg="black")
+    v_lbl.pack()
+    lbl_ratio = tk.Label(content, text="Ratio: 0.00", font=("Courier", 16, "bold"), bg=THEME["bg"])
+    lbl_ratio.pack()
+    entry = tk.Entry(content, font=("Helvetica", 16), justify="center")
+
+    btn_box = tk.Frame(root, bg=THEME["bg"], pady=20)
+    btn_box.pack(side="bottom", fill="x")
+    btn_next = tk.Button(btn_box, text="CONTINUE", bg=THEME["primary"], fg="white", font=("Arial", 11, "bold"), padx=20,
+                         pady=10)
+    btn_next.pack(side="right", padx=40)
+
+    data = {"step": 1, "open": 0, "closed": 0, "current": 0}
+
+    def update():
+        if current_state != "face_registration": return
+        if data["step"] <= 2:
+            ret, frame = cap.read()
+            if ret:
+                frame, faces = detector.findFaceMesh(frame, draw=True)
+                if faces:
+                    f = faces[0]
+                    v = detector.findDistance(f[159], f[23])[0]
+                    h = detector.findDistance(f[130], f[243])[0]
+                    r = (v / h) * 100
+                    smooth_ear_buffer.append(r)
+                    data["current"] = sum(smooth_ear_buffer) / len(smooth_ear_buffer)
+                    lbl_ratio.config(text=f"Eye Ratio: {data['current']:.2f}")
+
+                rgb = cv2.cvtColor(cv2.resize(frame, (400, 300)), cv2.COLOR_BGR2RGB)
+                img = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+                v_lbl.imgtk = img
+                v_lbl.configure(image=img)
+        root.after(30, update)
+
+    def next_step():
+        if data["step"] == 1:
+            data["open"] = data["current"]
+            data["step"] = 2
+            lbl_instr.config(text="Step 2/3: Close eyes gently.", fg=THEME["alert"])
+        elif data["step"] == 2:
+            data["closed"] = data["current"]
+            data["step"] = 3
+            lbl_instr.config(text="Step 3/3: Enter Name.", fg=THEME["text"])
+            v_box.pack_forget()
+            lbl_ratio.pack_forget()
+            entry.pack(pady=10)
+            create_keyboard(content, entry)
+            btn_next.config(text="SAVE")
+        elif data["step"] == 3:
+            nm = entry.get().strip()
+            if not nm: return
+            thr = ((data["open"] - data["closed"]) * 0.35) + data["closed"]
+            with open(f"{nm.replace(' ', '_')}.txt", "w") as f:
+                f.write(
+                    f"Name: {nm}\nOpenEye: {data['open']:.2f}\nClosedEye: {data['closed']:.2f}\nThreshold: {thr:.2f}\n")
+            set_state("driver_selection")
+
+    btn_next.config(command=next_step)
+    update()
+
+
+def build_operation_screen():
+    root.configure(bg=THEME["dark_mode"])
+    main = tk.Frame(root, bg=THEME["dark_mode"])
+    main.pack(fill="both", expand=True, padx=20, pady=20)
+
+    # Left Video
+    left = tk.Frame(main, bg="black", bd=2, relief="sunken")
+    left.pack(side="left", fill="both", expand=True)
+    left.pack_propagate(False)
+    vid_lbl = tk.Label(left, bg="black")
+    vid_lbl.pack(fill="both", expand=True)
+
+    # Right Dashboard
+    right = tk.Frame(main, bg=THEME["dark_mode"], width=320)
+    right.pack(side="right", fill="y", padx=(20, 0))
+    right.pack_propagate(False)
+
+    tk.Label(right, text="DROWSYCAM", font=("Helvetica", 18, "bold"), bg=THEME["dark_mode"], fg=THEME["primary"]).pack(
+        anchor="w")
+    driver_bar = tk.Frame(right, bg=THEME["dark_mode"])
+    driver_bar.pack(anchor="w", pady=(0, 5))
+
+    tk.Label(
+        driver_bar,
+        text=f"DRIVER: {selected_driver}",
+        font=("Helvetica", 12),
+        bg=THEME["dark_mode"],
+        fg="white"
+    ).pack(side="left")
+
+    btn_change_driver = tk.Button(
+        driver_bar,
+        text="CHANGE",
+        font=("Arial", 9, "bold"),
+        bg="#636e72",
+        fg="white",
+        relief="flat",
+        padx=8,
+        command=lambda: set_state("driver_selection")
+    )
+    btn_change_driver.pack(side="left", padx=8)
+
+    btn_history = tk.Button(
+        driver_bar,
+        text="HISTORY",
+        font=("Arial", 9, "bold"),
+        bg="#2d3436",
+        fg="white",
+        relief="flat",
+        padx=8,
+        command=lambda: set_state("history")
+    )
+    btn_history.pack(side="left", padx=4)
+
+    # Vehicle Stats Box
+    veh_box = tk.Frame(right, bg="#353b48", padx=10, pady=10)
+    veh_box.pack(fill="x", pady=10)
+    tk.Label(veh_box, text="VEHICLE STATUS", font=("Arial", 8), bg="#353b48", fg="#b2bec3").pack(anchor="w")
+    lbl_veh_status = tk.Label(veh_box, text="STATIONARY", font=("Arial", 16, "bold"), bg="#353b48", fg="white")
+    lbl_veh_status.pack(anchor="w")
+    lbl_speed = tk.Label(veh_box, text="0 KPH", font=("Courier", 20, "bold"), bg="#353b48", fg=THEME["info"])
+    lbl_speed.pack(anchor="e")
+
+    # Eye Stats Box
+    eye_box = tk.Frame(right, bg="#353b48", padx=10, pady=10)
+    eye_box.pack(fill="x")
+    tk.Label(eye_box, text="EYE RATIO", font=("Arial", 8), bg="#353b48", fg="#b2bec3").pack(anchor="w")
+    lbl_ear = tk.Label(eye_box, text="0.00", font=("Courier", 30, "bold"), bg="#353b48", fg=THEME["primary"])
+    lbl_ear.pack()
+
+    # Graph
+    g_frame = tk.Frame(right, bg=THEME["dark_mode"], height=150)
+    g_frame.pack(fill="x", pady=10)
+    fig, ax = plt.subplots(figsize=(3, 1.5), dpi=100)
+    fig.patch.set_facecolor(THEME["dark_mode"])
+    ax.set_facecolor(THEME["dark_mode"])
+    line, = ax.plot([], [], color=THEME["primary"], linewidth=2)
+    ax.set_ylim(10, 60)
+    ax.set_xlim(0, 50)
+    ax.axis('off')
+    canvas_plot = FigureCanvasTkAgg(fig, master=g_frame)
+    canvas_plot.get_tk_widget().pack(fill="both", expand=True)
+
+    # --- TELEMETRY PANEL ---
+    stats = tk.Frame(right, bg="#353b48", padx=10, pady=6)
+    stats.pack(fill="x", pady=(0, 2))
+
+    lbl_blinks = tk.Label(stats, text="BLINKS (1 MIN): 0", font=("Arial", 10, "bold"),
+                          bg="#353b48", fg="white")
+    lbl_blinks.pack(anchor="w")
+
+    lbl_droops = tk.Label(stats, text="DROOPS (1 MIN): 0", font=("Arial", 10, "bold"),
+                          bg="#353b48", fg="white")
+    lbl_droops.pack(anchor="w")
+
+    lbl_eye_state = tk.Label(stats, text="EYE STATE: OPEN", font=("Arial", 10, "bold"),
+                             bg="#353b48", fg=THEME["success"])
+    lbl_eye_state.pack(anchor="w")
+
+
+    lbl_sys_status = tk.Label(right, text="SYSTEM PAUSED", font=("Arial", 14, "bold"), bg=THEME["dark_mode"], fg="grey")
+    lbl_sys_status.pack(side="bottom", pady=20)
+    tk.Button(right, text="EXIT", bg="#636e72", fg="white", relief="flat",
+              command=lambda: set_state("driver_selection")).pack(side="bottom")
+
+    # --- OPERATION VARS ---
+    WARNING_COOLDOWN = 8
+    op = {
+        "status": "NORMAL",
+        "blink_start": None,
+        "blink_count": 0,
+        "last_blink": 0,
+        "meas": [],
+        "warn_start": 0,
+        "last_warning": 0,
+        "blink_times": deque(),
+        "droop_events": deque(),
+        "droop_start": None,
+        "droop_segments": 0,
+        "alarm_reason": None,
+
+    }
+
+    # These must be defined before use
+    overlay = None
+    count_lbl = None
+
+    def reset():
+        nonlocal overlay
+        stop_alarm_sound()
+
+        if overlay:
+            overlay.destroy()
+            overlay = None
+
+        # Reset state
+        op["status"] = "NORMAL"
+        op["blink_start"] = None
+        op["blink_count"] = 0
+        op["last_blink"] = 0
+        op["meas"] = []
+        op["warn_start"] = 0
+        op["last_warning"] = time.time()  # restart cooldown
+
+        # Clear rolling windows
+        op["blink_times"].clear()
+        op["droop_events"].clear()
+        op["droop_start"] = None
+        op["droop_segments"] = 0
+
+        # Clear smoothing buffers (VERY IMPORTANT)
+        smooth_ear_buffer.clear()
+        ratio_history.clear()
+
+        # Turn off vibration motor
+        if GPIO_AVAILABLE and Motors:
+            Motors.off()
+
+    def trigger_alarm():
+        log_alarm_event(op.get("alarm_reason", "UNKNOWN"))
+        op["status"] = "ALARM"
+        start_alarm_sound()
+        if GPIO_AVAILABLE:
+            try:
+                global Motors
+                if Motors is None: Motors = OutputDevice(17, active_high=True)
+                Motors.on()
+            except:
+                pass
+
+        nonlocal overlay
+        if overlay:
+            for w in overlay.winfo_children(): w.destroy()
+            overlay.config(bg=THEME["alert"])
+            tk.Label(overlay, text="DANGER", font=("Arial", 30, "bold"), bg=THEME["alert"], fg="white").pack(pady=30)
+            tk.Button(overlay, text="STOP ALARM", bg="white", fg="red", font=("Arial", 16), command=reset).pack()
+
+    def show_warning(msg):
+
+        nonlocal overlay, count_lbl
+        now = time.time()
+
+        # Cooldown Check
+        if (now - op["last_warning"]) < WARNING_COOLDOWN:
+            return
+
+        # Don't overwrite existing warning
+        if op["status"] != "NORMAL":
+            return
+
+        start_alarm_sound()
+
+        op["status"] = "PRE_WARNING"
+        op["warn_start"] = time.time()
+        op["last_warning"] = now
+
+        overlay = tk.Frame(left, bg=THEME["warning"])
+        overlay.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.8, relheight=0.6)
+
+        tk.Label(overlay, text="⚠️ ARE YOU AWAKE?", font=("Arial", 22, "bold"), bg=THEME["warning"]).pack(pady=20)
+        tk.Label(overlay, text=msg, font=("Arial", 14), bg=THEME["warning"]).pack()
+
+        count_lbl = tk.Label(overlay, text="3", font=("Arial", 60, "bold"), bg=THEME["warning"], fg="red")
+        count_lbl.pack()
+
+        tk.Button(overlay, text="YES", bg="white", font=("Arial", 14), command=reset).pack(pady=10)
+
+    def loop():
+        if current_state != "operation": return
+        try:
+            ret, frame = cap.read()
+            if ret:
+                w, h = left.winfo_width(), left.winfo_height()
+                if w > 10 and h > 10:
+                    frame, faces = detector.findFaceMesh(frame, draw=True)
+                    frame_resized = cv2.resize(frame, (w, h))
+
+                    # --- VEHICLE DYNAMICS ---
+                    v_state, v_speed = mpu.get_vehicle_status()
+                    lbl_veh_status.config(text=v_state)
+                    lbl_speed.config(text=f"{int(v_speed)} KPH")
+
+                    check_drowsy = False
+                    if v_state == "STATIONARY":
+                        lbl_veh_status.config(fg="white")
+                        lbl_sys_status.config(text="SYSTEM PAUSED", fg="grey")
+                    elif "TURNING" in v_state:
+                        lbl_veh_status.config(fg=THEME["warning"])
+                        lbl_sys_status.config(text=f"{v_state} (PAUSED)", fg=THEME["warning"])
+                    else:
+                        lbl_veh_status.config(fg=THEME["success"])
+                        lbl_sys_status.config(text="SYSTEM ACTIVE", fg=THEME["success"])
+                        check_drowsy = True
+
+                    # --- MAIN DROWSINESS LOGIC ---
+                    if faces:
+                        f = faces[0]
+                        v = detector.findDistance(f[159], f[23])[0]
+                        h = detector.findDistance(f[130], f[243])[0]
+                        raw = (v / h) * 100
+                        smooth_ear_buffer.append(raw)
+                        ear = sum(smooth_ear_buffer) / len(smooth_ear_buffer)
+                        lbl_ear.config(text=f"{ear:.2f}")
+
+                        ratio_history.append(ear)
+                        line.set_data(range(len(ratio_history)), list(ratio_history))
+                        canvas_plot.draw_idle()
+
+                        now = time.time()
+
+                        # Disable driver change during alerts
+                        if op["status"] in ("PRE_WARNING", "ALARM"):
+                            btn_change_driver.config(state="disabled")
+                        else:
+                            btn_change_driver.config(state="normal")
+
+                        # Droop Threshold Calculation
+                        droop_threshold = driver_closed_eye + (driver_open_eye - driver_closed_eye) * 0.7
+
+                        if op["status"] == "NORMAL" and check_drowsy:
+                            is_open = raw > driver_threshold
+                            is_drooping = ear < droop_threshold
+
+                            # --- Rule 1: Eyes Closed ---
+                            if not is_open:
+                                if op["blink_start"] is None:
+                                    op["blink_start"] = now
+                                elif now - op["blink_start"] > 1.2:
+                                    op["alarm_reason"] = "EYES CLOSED"
+                                    show_warning("EYES CLOSED")
+                            else:
+                                if op["blink_start"]:
+                                    op["blink_start"] = None
+
+                                    # 500ms blink cooldown
+                                    if now - op["last_blink"] >= 0.5:
+                                        op["blink_times"].append(now)
+                                        op["last_blink"] = now
+
+                                    while op["blink_times"] and (now - op["blink_times"][0] > 60):
+                                        op["blink_times"].popleft()
+
+                                    if len(op["blink_times"]) >= 30:  # Strict limit
+                                        op["alarm_reason"] = "FREQUENT BLINKING"
+                                        show_warning("FREQUENT BLINKING")
+
+                            # --- Rule 2: Drooping Eyelids ---
+                            if is_drooping:
+                                if op["droop_start"] is None:
+                                    op["droop_start"] = now
+                                    op["droop_segments"] = 0
+                                else:
+                                    elapsed = now - op["droop_start"]
+                                    segments = int(elapsed // 2)
+
+                                    if segments > op["droop_segments"]:
+                                        new_events = segments - op["droop_segments"]
+                                        for _ in range(new_events):
+                                            op["droop_events"].append(now)
+                                        op["droop_segments"] = segments
+
+                                        # Rolling Droop Counter
+                                        while op["droop_events"] and (now - op["droop_events"][0] > 60):
+                                            op["droop_events"].popleft()
+
+                                        if len(op["droop_events"]) >= 6:
+                                            op["alarm_reason"] = "DROPPING EYELIDS"
+                                            show_warning("DROPPING EYELIDS")
+                            else:
+                                op["droop_start"] = None
+                                op["droop_segments"] = 0
+
+                            # --- TELEMETRY UPDATE ---
+                            lbl_blinks.config(text=f"BLINKS (1 MIN): {len(op['blink_times'])}")
+                            lbl_droops.config(text=f"DROOPS (1 MIN): {len(op['droop_events'])}")
+
+                            if is_drooping:
+                                lbl_eye_state.config(text="EYE STATE: DROOPING", fg=THEME["warning"])
+                            else:
+                                lbl_eye_state.config(text="EYE STATE: OPEN", fg=THEME["success"])
+
+
+                        elif op["status"] == "PRE_WARNING":
+                            elapsed = int(time.time()- op["warn_start"])
+                            rem = 3 - elapsed
+
+                            if rem > 0:
+                                if count_lbl: count_lbl.config(text=str(rem))
+                            else:
+                                trigger_alarm()
+
+                    rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                    img = ImageTk.PhotoImage(image=Image.fromarray(rgb))
+                    vid_lbl.imgtk = img
+                    vid_lbl.configure(image=img)
+
+        except Exception as e:
+            print(e)
+            pass
+
+        update_alarm_sound()
+
+        root.after(20, loop)
+
+
+
+    # Start the loop
+    loop()
+
+
+root = tk.Tk()
+root.title("DrowsyCam Professional")
+root.geometry("1024x600")
+root.protocol("WM_DELETE_WINDOW", on_close)
+root.bind("<Escape>", lambda e: root.attributes("-fullscreen", False))
+set_state("start")
+root.mainloop()
